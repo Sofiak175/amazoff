@@ -1,0 +1,600 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import html, dcc, Input, Output, State, callback_context, no_update
+from dash.dependencies import ALL
+import json, time, io, base64
+import numpy as np
+import pandas as pd
+from PIL import Image
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
+from functools import lru_cache
+from threading import Lock
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# ------------------------------
+# Data Loading & Preprocessing
+# ------------------------------
+cache_lock = Lock()
+
+file_path = r"C:\Users\deves\CT Final\datasw2\product_images_for_prediction.csv"
+df = pd.read_csv(file_path)
+embeddings = df.values / 255.0  # Normalize pixel values to [0,1]
+items_per_page = 50
+
+num_categories = 10
+kmeans = KMeans(n_clusters=num_categories, random_state=42)
+cluster_labels = kmeans.fit_predict(embeddings)
+category_names = {i: f"Category {i+1}" for i in range(num_categories)}
+df_with_labels = pd.DataFrame({
+    'index': range(len(embeddings)),
+    'category': [category_names[label] for label in cluster_labels]
+})
+
+knn = NearestNeighbors(n_neighbors=4, metric="cosine")
+knn.fit(embeddings)
+
+# ------------------------------
+# Utility: Image Generation
+# ------------------------------
+@lru_cache(maxsize=1000)
+def generate_image(index):
+    """Generate a base64 image string from an embedding and display it with matplotlib."""
+    try:
+        image = embeddings[index].reshape(28, 28) * 255  # Scale back to 0-255
+        
+        # Display the image using matplotlib
+        fig, ax = plt.subplots(figsize=(2, 2))
+        ax.imshow(image, cmap='gnuplot2_r')
+        ax.axis("off")
+
+        # Save the plot to a buffer
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format="PNG", bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+
+        # Encode image to base64
+        encoded_image = base64.b64encode(buffer.getvalue()).decode()
+        return f"data:image/png;base64,{encoded_image}"
+    except Exception as e:
+        print(f"Error generating image for index {index}: {e}")
+        return ""
+
+# ------------------------------
+# Helper: Create Grid Page (Gallery)
+# ------------------------------
+def create_grid_page(page_num, filtered_indices):
+    start_idx = page_num * items_per_page
+    end_idx = min(start_idx + items_per_page, len(filtered_indices))
+    if start_idx >= len(filtered_indices):
+        return html.Div([
+            html.Div([
+                html.I(className="fas fa-search me-2"),
+                html.Span("No products match your filter criteria")
+            ], className="d-flex align-items-center justify-content-center")
+        ], className="text-center py-5")
+    page_indices = filtered_indices[start_idx:end_idx]
+    grid_images = []
+    for i in page_indices:
+        i = int(i)
+        header_color = "#E3F2FD"
+        footer_color = "#BBDEFB"
+        grid_images.append(
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.Img(
+                            src=generate_image(i),
+                            id={"type": "grid-image", "index": i},
+                            className="img-fluid",
+                            style={"maxWidth": "95%", "marginTop": "5px", "marginBottom": "5px"}
+                        )
+                    ], style={"display": "flex", "justifyContent": "center", "alignItems": "center", "height": "160px"})
+                ], style={"backgroundColor": header_color, "borderRadius": "8px 8px 0 0", "padding": "20px 10px"}),
+                html.Div([
+                    html.Button(
+                        "Add to Cart",
+                        id={"type": "add-to-cart", "index": i},
+                        className="btn-add-to-cart",
+                        n_clicks=0
+                    )
+                ], className="card-body text-center py-2", style={"backgroundColor": footer_color, "borderRadius": "0 0 8px 8px"})
+            ], className="product-card shadow")
+        )
+    return html.Div([
+        html.Div(grid_images, className="row row-cols-1 row-cols-sm-2 row-cols-md-3 g-4")
+    ])
+
+# ------------------------------
+# Helper: Create Cart Suggestions from All Cart Items
+# ------------------------------
+def create_cart_suggestions_from_cart(cart_items):
+    total_quantity = sum(item['quantity'] for item in cart_items)
+    if total_quantity == 0:
+        return html.Div()
+    avg_embedding = np.zeros(embeddings.shape[1])
+    for item in cart_items:
+        avg_embedding += item['quantity'] * embeddings[item['product_id']]
+    avg_embedding /= total_quantity
+    distances, indices = knn.kneighbors([avg_embedding])
+    recommended_indices = [int(idx) for idx in indices[0][1:4]]
+    header_color = "#E3F2FD"
+    footer_color = "#BBDEFB"
+    accent_color = "#1565C0"
+    suggestions = html.Div([
+        html.H3("You might also like:", className="text-center mb-4", style={"color": accent_color}),
+        html.Div(
+            [
+                html.Div([
+                    html.Div([
+                        html.Img(
+                            src=generate_image(idx),
+                            id={"type": "recommended-image", "index": idx},
+                            className="img-fluid p-3",
+                            style={"maxHeight": "220px"}
+                        )
+                    ], style={"backgroundColor": header_color, "borderRadius": "8px 8px 0 0"}),
+                    html.Div([
+                        html.H5(f"Product #{idx}", className="card-title fw-bold"),
+                        html.Div([
+                            html.Span("Similarity:", className="me-2"),
+                            html.Span(
+                                f"{(1 - distances[0][recommended_indices.index(idx)+1])*100:.1f}%",
+                                className="fw-bold",
+                                style={"color": accent_color}
+                            )
+                        ], className="d-flex justify-content-center align-items-center")
+                    ], className="card-body text-center py-3", 
+                       style={"backgroundColor": footer_color, "borderRadius": "0 0 8px 8px", "color": accent_color}),
+                    html.Div([
+                        html.Button("Add to Cart", id={"type": "add-to-cart", "index": idx},
+                                    n_clicks=0, className="btn btn-sm btn-primary")
+                    ], style={"padding": "10px"})
+                ], className="card h-100 recommended-product")
+                for idx in recommended_indices
+            ],
+            className="row"
+        )
+    ])
+    return suggestions
+
+# ------------------------------
+# Helper: Create Recommendation Page (Single Product)
+# ------------------------------
+def create_recommendation_page(product_idx):
+    product_idx = int(product_idx)
+    distances, indices = knn.kneighbors([embeddings[product_idx]])
+    recommended_indices = [int(idx) for idx in indices[0][1:4]]
+    product_category = df_with_labels.loc[df_with_labels['index'] == product_idx, 'category'].values[0]
+    header_color = "#E3F2FD"
+    footer_color = "#BBDEFB"
+    accent_color = "#1565C0"
+    recommended_products = html.Div(
+        [
+            html.Div([
+                html.Div([
+                    html.Img(
+                        src=generate_image(idx),
+                        id={"type": "recommended-image", "index": idx},
+                        className="img-fluid p-3",
+                        style={"maxHeight": "220px"}
+                    )
+                ], style={"backgroundColor": header_color, "borderRadius": "8px 8px 0 0"}),
+                html.Div([
+                    html.H5(f"Product #{idx}", className="card-title fw-bold"),
+                    html.Div([
+                        html.Span("Similarity:", className="me-2"),
+                        html.Span(
+                            f"{(1 - distances[0][recommended_indices.index(idx)+1])*100:.1f}%",
+                            className="fw-bold",
+                            style={"color": accent_color}
+                        )
+                    ], className="d-flex justify-content-center align-items-center")
+                ], className="card-body text-center py-3",
+                   style={"backgroundColor": footer_color, "borderRadius": "0 0 8px 8px", "color": accent_color}),
+                html.Div([
+                    html.Button("Add to Cart", id={"type": "add-to-cart", "index": idx},
+                                n_clicks=0, className="btn btn-sm btn-primary")
+                ], style={"padding": "10px"})
+            ], className="card h-100 recommended-product")
+            for idx in recommended_indices
+        ],
+        className="row"
+    )
+    return html.Div([
+        html.Div([
+            html.H3(f"Product #{product_idx}", className="card-title mb-2 fw-bold"),
+            html.Span(
+                product_category,
+                className="badge px-3 py-2",
+                style={"backgroundColor": footer_color, "color": accent_color}
+            )
+        ], className="card-header border-bottom-0 d-flex justify-content-between align-items-center p-4",
+           style={"backgroundColor": header_color}),
+        html.Div([
+            html.Img(
+                src=generate_image(product_idx),
+                className="img-fluid rounded mx-auto d-block shadow",
+                style={"maxHeight": "350px", "width": "auto", "border": f"10px solid {footer_color}"}
+            )
+        ], className="card-body text-center py-5"),
+        html.Div([
+            html.H3("Recommended Products", className="text-center mb-4 pb-3",
+                    style={"borderBottom": f"2px solid {accent_color}", "color": accent_color}),
+            recommended_products
+        ])
+    ], className="container py-4")
+
+# ------------------------------
+# App Initialization and Layout
+# ------------------------------
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+app.config.suppress_callback_exceptions = True
+
+app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
+    # Permanent Back to Gallery button (initially hidden)
+    html.Button("Back to Gallery", id="back-to-gallery", n_clicks=0, style={"display": "none"}),
+    dcc.Store(id="cart-items", data=[]),
+    dcc.Store(id="current-page", data=0),
+    dcc.Store(id="selected-product", data=None),
+    dcc.Store(id="filtered-indices", data=list(range(len(embeddings)))),
+    dcc.Interval(id="toast-interval", interval=3000, disabled=True, n_intervals=0),
+    html.Div([
+        html.H1("Product Discovery", className="display-4 fw-bold"),
+        html.P("Explore products and discover similar items with AI-powered recommendations", className="lead")
+    ], className="app-header px-4 py-5 text-center"),
+    html.Div([
+        html.Div([
+            html.I(className="fas fa-shopping-cart me-2"),
+            html.Span("0", id="cart-count", className="badge bg-danger rounded-pill")
+        ], className="d-flex align-items-center")
+    ], id="cart-icon", n_clicks=0, className="position-fixed top-0 end-0 m-4 p-2 bg-white rounded-circle shadow",
+       style={"zIndex": "1000", "width": "40px", "height": "40px", "display": "flex", "justifyContent": "center", "cursor": "pointer"}),
+    html.Div([
+        html.Div(id="filter-panel", children=[
+            html.H4("Filter Products", className="mb-3"),
+            dcc.Dropdown(
+                id="category-filter",
+                options=[{"label": name, "value": name} for name in category_names.values()],
+                multi=True,
+                placeholder="Select categories to filter...",
+                className="mb-3",
+                style={"color": "#333", "background-color": "white"}
+            ),
+            html.Button("Apply Filter", id="apply-filter", className="custom-button btn btn-light",
+                        style={"marginRight": "10px", "backgroundColor": "white", "color": "#333"}),
+            html.Button("Clear Filter", id="clear-filter", className="custom-button btn btn-outline-light")
+        ], className="filter-panel p-4 shadow"),
+        html.H3(id="page-number", className="text-center my-4"),
+        dcc.Loading(id="loading", type="circle", color="#3498db", children=html.Div(id="page-content", className="page-content")),
+        html.Div(id="pagination-buttons", children=[
+            html.Button("Previous", id="prev-button", n_clicks=0, className="custom-button btn btn-primary me-2"),
+            html.Button("Next", id="next-button", n_clicks=0, className="custom-button btn btn-primary")
+        ], className="text-center my-4"),
+        html.Div(
+            dbc.Toast(
+                "Item added to cart! Click here to view cart.",
+                id="cart-toast",
+                header="Success",
+                is_open=False,
+                dismissable=True,
+                icon="success",
+                style={"position": "fixed", "top": 66, "right": 10, "width": 300, "zIndex": 1999}
+            ),
+            id="toast-wrapper",
+            n_clicks=0,
+            style={"cursor": "pointer"}
+        ),
+        # --- New CSV Download Components ---
+        html.Button("Download CSV", id="download-csv-button", n_clicks=0,
+                    style={"position": "fixed", "bottom": "10px", "right": "10px", "zIndex": "1000"}),
+        dcc.Download(id="download-csv")
+    ], className="main-container")
+])
+
+# ------------------------------
+# Callback: Update Back Button Visibility
+# ------------------------------
+@app.callback(
+    Output("back-to-gallery", "style"),
+    [Input("url", "pathname"), Input("selected-product", "data")]
+)
+def update_back_button_style(pathname, selected_product):
+    if pathname == "/cart" or (pathname == "/" and selected_product is not None):
+        return {"display": "block", "margin": "10px"}
+    return {"display": "none"}
+
+# ------------------------------
+# Navigation Callback
+# ------------------------------
+@app.callback(
+    Output("url", "pathname"),
+    [Input("back-to-gallery", "n_clicks"),
+     Input("toast-wrapper", "n_clicks"),
+     Input("cart-icon", "n_clicks")]
+)
+def navigate_url(back_clicks, toast_clicks, cart_clicks):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    if triggered_id == "back-to-gallery":
+        return "/"
+    return "/cart"
+
+# ------------------------------
+# Callback: Clear Selected Product When Going Back
+# ------------------------------
+@app.callback(
+    Output("selected-product", "data", allow_duplicate=True),
+    Input("back-to-gallery", "n_clicks"),
+    prevent_initial_call=True
+)
+def clear_selected_product(n_clicks):
+    if n_clicks:
+        return None
+    raise dash.exceptions.PreventUpdate
+
+# ------------------------------
+# Callback: Render Page Based on URL
+# ------------------------------
+@app.callback(
+    [Output("page-content", "children"),
+     Output("filter-panel", "style"),
+     Output("page-number", "style"),
+     Output("pagination-buttons", "style")],
+    [Input("url", "pathname"),
+     Input("selected-product", "data"),
+     Input("current-page", "data"),
+     Input("filtered-indices", "data"),
+     Input("cart-items", "data")]
+)
+def render_page(pathname, selected_product, page_num, filtered_indices, cart_items):
+    if pathname == "/cart":
+        if not cart_items:
+            content = html.Div("Your cart is empty", className="text-center py-5")
+        else:
+            cart_items_list = []
+            for item in sorted(cart_items, key=lambda x: x["added_at"], reverse=True):
+                product_id = item["product_id"]
+                cart_items_list.append(
+                    html.Div([
+                        html.Div([html.Img(src=generate_image(product_id),
+                                           style={"width": "50px", "height": "50px", "borderRadius": "4px"})],
+                                 className="col-3"),
+                        html.Div([
+                            html.H6(f"Product #{product_id}"),
+                            html.P(f"Quantity: {item['quantity']}", className="small text-muted")
+                        ], className="col-7"),
+                        html.Div([
+                            html.Button("×",
+                                        id={"type": "remove-from-cart", "index": product_id},
+                                        className="btn btn-sm btn-outline-danger",
+                                        style={"borderRadius": "50%", "width": "30px", "height": "30px", "padding": "0"})
+                        ], className="col-2 d-flex align-items-center justify-content-center")
+                    ], className="row border-bottom py-2 align-items-center")
+                )
+            suggestions = create_cart_suggestions_from_cart(cart_items)
+            content = html.Div([
+                html.Div(cart_items_list),
+                html.Div([html.H5(f"Total Items: {sum([i['quantity'] for i in cart_items])}")],
+                         className="mt-3 pt-2 border-top"),
+                suggestions
+            ])
+        return content, {"display": "none"}, {"display": "none"}, {"display": "none"}
+    else:
+        if selected_product is None:
+            filter_style = {
+                "borderRadius": "10px",
+                "background": "linear-gradient(to right, #3498db, #2c3e50)",
+                "padding": "15px",
+                "color": "white",
+                "marginBottom": "20px"
+            }
+            page_number_style = {"textAlign": "center", "margin": "20px 0"}
+            pagination_style = {"textAlign": "center", "marginBottom": "20px"}
+            content = create_grid_page(page_num, filtered_indices)
+        else:
+            filter_style = {"display": "none"}
+            page_number_style = {"display": "none"}
+            pagination_style = {"display": "none"}
+            content = create_recommendation_page(selected_product)
+        return content, filter_style, page_number_style, pagination_style
+
+# ------------------------------
+# Callback: Update Cart Count Notification
+# ------------------------------
+@app.callback(
+    Output("cart-count", "children"),
+    Input("cart-items", "data")
+)
+def update_cart_count(cart_items):
+    total_quantity = sum(item.get("quantity", 0) for item in cart_items)
+    return str(total_quantity)
+
+# ------------------------------
+# Callback: Add to Cart (Increase Quantity)
+# ------------------------------
+@app.callback(
+    [Output("cart-items", "data", allow_duplicate=True),
+     Output("cart-toast", "is_open")],
+    [Input({"type": "add-to-cart", "index": ALL}, "n_clicks")],
+    [State("cart-items", "data")],
+    prevent_initial_call=True
+)
+def add_to_cart(n_clicks_list, current_cart):
+    ctx = callback_context
+    if not ctx.triggered or not any(n for n in n_clicks_list if n):
+        raise dash.exceptions.PreventUpdate
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    if not button_id:
+        raise dash.exceptions.PreventUpdate
+    index_dict = json.loads(button_id)
+    product_idx = int(index_dict["index"])
+    found = False
+    for item in current_cart:
+        if item["product_id"] == product_idx:
+            item["quantity"] += 1
+            found = True
+            break
+    if not found:
+        current_cart.append({
+            "product_id": product_idx,
+            "quantity": 1,
+            "added_at": time.time()
+        })
+    return current_cart, True
+
+# ------------------------------
+# Callback: Remove from Cart (Decrease or Remove)
+# ------------------------------
+@app.callback(
+    Output("cart-items", "data", allow_duplicate=True),
+    [Input({"type": "remove-from-cart", "index": ALL}, "n_clicks")],
+    [State("cart-items", "data")],
+    prevent_initial_call=True
+)
+def remove_from_cart(n_clicks_list, current_cart):
+    if not any(n_clicks_list):
+        raise dash.exceptions.PreventUpdate
+    ctx = callback_context
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    remove_item = json.loads(button_id)
+    product_idx = int(remove_item["index"])
+    new_cart = []
+    for item in current_cart:
+        if item["product_id"] == product_idx:
+            if item["quantity"] > 1:
+                item["quantity"] -= 1
+                new_cart.append(item)
+        else:
+            new_cart.append(item)
+    return new_cart
+
+# ------------------------------
+# Callback: Filters and Pagination
+# ------------------------------
+@app.callback(
+    [Output("filtered-indices", "data"),
+     Output("current-page", "data", allow_duplicate=True),
+     Output("selected-product", "data", allow_duplicate=True)],
+    [Input("apply-filter", "n_clicks"),
+     Input("clear-filter", "n_clicks")],
+    [State("category-filter", "value")],
+    prevent_initial_call=True
+)
+def handle_filters(apply_clicks, clear_clicks, selected_categories):
+    ctx = callback_context
+    if not ctx.triggered:
+        raise dash.exceptions.PreventUpdate
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    if button_id == "clear-filter" or not selected_categories:
+        return list(range(len(embeddings))), 0, None
+    filtered_df = df_with_labels[df_with_labels['category'].isin(selected_categories)]
+    filtered_indices = filtered_df['index'].tolist()
+    return filtered_indices, 0, None
+
+@app.callback(
+    Output("selected-product", "data", allow_duplicate=True),
+    [Input({"type": "grid-image", "index": ALL}, "n_clicks")],
+    prevent_initial_call=True
+)
+def handle_grid_click(n_clicks_list):
+    ctx = callback_context
+    if not ctx.triggered or ctx.triggered[0]["value"] is None:
+        raise dash.exceptions.PreventUpdate
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    index_dict = json.loads(button_id)
+    return int(index_dict["index"])
+
+@app.callback(
+    Output("selected-product", "data", allow_duplicate=True),
+    [Input({"type": "recommended-image", "index": ALL}, "n_clicks")],
+    prevent_initial_call=True
+)
+def handle_recommended_click(n_clicks_list):
+    ctx = callback_context
+    if not ctx.triggered or ctx.triggered[0]["value"] is None:
+        raise dash.exceptions.PreventUpdate
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    index_dict = json.loads(button_id)
+    return int(index_dict["index"])
+
+@app.callback(
+    [Output("current-page", "data"),
+     Output("selected-product", "data", allow_duplicate=True)],
+    [Input("prev-button", "n_clicks"), Input("next-button", "n_clicks")],
+    [State("current-page", "data"), State("filtered-indices", "data")],
+    prevent_initial_call=True
+)
+def update_page(prev_clicks, next_clicks, current_page, filtered_indices):
+    ctx = callback_context
+    if not ctx.triggered:
+        return current_page, None
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    max_page = (len(filtered_indices) + items_per_page - 1) // items_per_page - 1
+    if button_id == "prev-button" and current_page > 0:
+        return current_page - 1, None
+    elif button_id == "next-button" and current_page < max_page:
+        return current_page + 1, None
+    return current_page, None
+
+@app.callback(
+    Output("page-number", "children"),
+    [Input("current-page", "data"), Input("filtered-indices", "data")]
+)
+def update_page_number(page_num, filtered_indices):
+    total_pages = max(1, (len(filtered_indices) + items_per_page - 1) // items_per_page)
+    return html.Div([
+        html.Span(f"Page {page_num + 1} of {total_pages}", className="mx-2"),
+        html.Span(f"{len(filtered_indices)} products", className="badge bg-primary ms-2")
+    ])
+
+# ------------------------------
+# Callback: Toast Auto-Close Using dcc.Interval
+# ------------------------------
+@app.callback(
+    Output("toast-interval", "disabled"),
+    [Input("cart-toast", "is_open")]
+)
+def enable_toast_interval(is_open):
+    return not is_open
+
+@app.callback(
+    [Output("cart-toast", "is_open", allow_duplicate=True),
+     Output("toast-interval", "n_intervals")],
+    [Input("toast-interval", "n_intervals")],
+    [State("cart-toast", "is_open")],
+    prevent_initial_call=True
+)
+def auto_close_toast(n_intervals, is_open):
+    if is_open:
+        return False, 0
+    return is_open, 0
+
+# ------------------------------
+# New Callback: Download CSV Functionality
+# ------------------------------
+@app.callback(
+    Output("download-csv", "data"),
+    Input("download-csv-button", "n_clicks"),
+    prevent_initial_call=True
+)
+def download_csv(n_clicks):
+    if n_clicks:
+        return dcc.send_data_frame(df.to_csv, "product_images_for_prediction.csv", index=False)
+    raise dash.exceptions.PreventUpdate
+
+# ------------------------------
+# Pre-cache Images and Run Server
+# ------------------------------
+if __name__ == "__main__":
+    for idx in range(min(items_per_page, len(embeddings))):
+        try:
+            generate_image(idx)
+        except Exception as e:
+            print(f"Error pre-caching image {idx}: {e}")
+    app.run_server(debug=True, port=8059)
